@@ -1,0 +1,333 @@
+#include "stm32f4xx.h"
+#include <stdint.h>
+#include <string.h>
+
+#define BIT(x)              (1UL << (x))
+#define SYSCLK_HZ           16000000UL
+#define LCD_ADDR            0x27      
+#define PASSWORD            "0123"
+#define PASSWORD_LENGTH     4
+
+#define BUZZER_PIN          0         
+#define LCD_SCL_PIN         6         
+#define LCD_SDA_PIN         7         
+#define SERVO_PIN           10        
+
+#define LCD_RS              0x01
+#define LCD_EN              0x04
+#define LCD_BL              0x08
+
+#define SERVO_OPEN_ANGLE    50
+#define SERVO_LOCK_ANGLE    110
+
+volatile uint8_t keypad_interrupt_flag = 0;
+char entered_password[8];
+uint8_t password_index = 0;
+
+char keymap[4][4] = {
+    {'1','2','3','A'},
+    {'4','5','6','B'},
+    {'7','8','9','C'},
+    {'*','0','#','D'}
+};
+
+/* ---------- Delay Subroutines ---------- */
+
+void delay_us(uint32_t us) {
+    SysTick->LOAD = (SYSCLK_HZ / 1000000UL) - 1;
+    SysTick->VAL = 0;
+    SysTick->CTRL = 5;
+    while (us--) {
+        while ((SysTick->CTRL & BIT(16)) == 0);
+    }
+    SysTick->CTRL = 0;
+}
+
+void delay_ms(uint32_t ms) {
+    while (ms--) delay_us(1000);
+}
+
+/* ---------- GPIO and Interrupt ---------- */
+
+void keypad_idle_mode(void) {
+    GPIOA->ODR &= ~(BIT(0) | BIT(1) | BIT(2) | BIT(3));
+}
+
+void gpio_init(void) {
+    RCC->AHB1ENR |= BIT(0) | BIT(1);
+    (void)RCC->AHB1ENR;
+
+    for (int p = 0; p <= 7; p++) {
+        GPIOA->MODER &= ~(3UL << (p * 2));
+        GPIOA->PUPDR &= ~(3UL << (p * 2));
+    }
+
+    for (int p = 0; p <= 3; p++) GPIOA->MODER |= (1UL << (p * 2));
+    for (int p = 4; p <= 7; p++) GPIOA->PUPDR |= (1UL << (p * 2));
+
+    int pinsB[] = {BUZZER_PIN, LCD_SCL_PIN, LCD_SDA_PIN, SERVO_PIN};
+
+    for (int i = 0; i < 4; i++) {
+        int p = pinsB[i];
+        GPIOB->MODER &= ~(3UL << (p * 2));
+        GPIOB->MODER |=  (1UL << (p * 2));
+        GPIOB->OSPEEDR |= (3UL << (p * 2));
+        GPIOB->PUPDR &= ~(3UL << (p * 2));
+    }
+
+    GPIOB->OTYPER |= BIT(LCD_SCL_PIN) | BIT(LCD_SDA_PIN);
+    GPIOB->OTYPER &= ~(BIT(BUZZER_PIN) | BIT(SERVO_PIN));
+
+    GPIOB->ODR |= BIT(LCD_SCL_PIN) | BIT(LCD_SDA_PIN);
+    GPIOB->ODR &= ~(BIT(BUZZER_PIN) | BIT(SERVO_PIN));
+
+    keypad_idle_mode();
+}
+
+void keypad_interrupt_init(void) {
+    RCC->APB2ENR |= BIT(14);
+    SYSCFG->EXTICR[1] &= ~0xFFFFUL;
+
+    EXTI->IMR  |= BIT(4) | BIT(5) | BIT(6) | BIT(7);
+    EXTI->FTSR |= BIT(4) | BIT(5) | BIT(6) | BIT(7);
+    EXTI->RTSR &= ~(BIT(4) | BIT(5) | BIT(6) | BIT(7));
+    EXTI->PR = BIT(4) | BIT(5) | BIT(6) | BIT(7);
+
+    NVIC_EnableIRQ(EXTI4_IRQn);
+    NVIC_EnableIRQ(EXTI9_5_IRQn);
+    __enable_irq();
+}
+
+void EXTI4_IRQHandler(void) {
+    if (EXTI->PR & BIT(4)) {
+        EXTI->PR = BIT(4);
+        keypad_interrupt_flag = 1;
+    }
+}
+
+void EXTI9_5_IRQHandler(void) {
+    if (EXTI->PR & (BIT(5) | BIT(6) | BIT(7))) {
+        EXTI->PR = BIT(5) | BIT(6) | BIT(7);
+        keypad_interrupt_flag = 1;
+    }
+}
+
+/* ---------- LCD I2C Subroutines ---------- */
+
+void scl_high(void) { GPIOB->ODR |= BIT(LCD_SCL_PIN); }
+void scl_low(void)  { GPIOB->ODR &= ~BIT(LCD_SCL_PIN); }
+void sda_high(void) { GPIOB->ODR |= BIT(LCD_SDA_PIN); }
+void sda_low(void)  { GPIOB->ODR &= ~BIT(LCD_SDA_PIN); }
+void i2c_delay(void) { delay_us(5); }
+
+void i2c_start(void) {
+    sda_high(); scl_high(); i2c_delay();
+    sda_low(); i2c_delay();
+    scl_low();
+}
+
+void i2c_stop(void) {
+    sda_low(); scl_high(); i2c_delay();
+    sda_high(); i2c_delay();
+}
+
+void i2c_write(uint8_t data) {
+    for (int i = 0; i < 8; i++) {
+        if (data & 0x80) sda_high();
+        else sda_low();
+        scl_high(); i2c_delay();
+        scl_low(); i2c_delay();
+        data <<= 1;
+    }
+    sda_high();
+    scl_high(); i2c_delay();
+    scl_low();
+}
+
+void lcd_i2c(uint8_t data) {
+    i2c_start();
+    i2c_write((LCD_ADDR << 1) | 0);
+    i2c_write(data);
+    i2c_stop();
+}
+
+void lcd_write4(uint8_t data) {
+    lcd_i2c(data | LCD_BL);
+    lcd_i2c(data | LCD_EN | LCD_BL);
+    lcd_i2c((data & ~LCD_EN) | LCD_BL);
+    delay_us(50);
+}
+
+void lcd_send(uint8_t value, uint8_t mode) {
+    lcd_write4((value & 0xF0) | mode);
+    lcd_write4(((value << 4) & 0xF0) | mode);
+}
+
+void lcd_cmd(uint8_t cmd) { lcd_send(cmd, 0); }
+void lcd_data(uint8_t data) { lcd_send(data, LCD_RS); }
+
+void lcd_clear(void) {
+    lcd_cmd(0x01);
+    delay_ms(2);
+}
+
+void lcd_set_cursor(uint8_t row, uint8_t col) {
+    if (row == 0) lcd_cmd(0x80 + col);
+    else lcd_cmd(0xC0 + col);
+}
+
+void lcd_print(const char *text) {
+    while (*text) lcd_data((uint8_t)*text++);
+}
+
+void lcd_init(void) {
+    delay_ms(50);
+    lcd_write4(0x30);
+    delay_ms(5);
+    lcd_write4(0x30);
+    delay_ms(1);
+    lcd_write4(0x30);
+    delay_ms(10);
+    lcd_write4(0x20);
+
+    lcd_cmd(0x28);
+    lcd_cmd(0x0C);
+    lcd_cmd(0x06);
+    lcd_clear();
+}
+
+/* ---------- Buzzer and Servo ---------- */
+
+void buzzer_beep(uint8_t times) {
+    for (int i = 0; i < times; i++) {
+        GPIOB->ODR |= BIT(BUZZER_PIN);
+        delay_ms(200);
+        GPIOB->ODR &= ~BIT(BUZZER_PIN);
+        delay_ms(150);
+    }
+}
+
+void servo_write_angle(uint8_t angle) {
+    uint16_t pulse = 500 + ((uint32_t)angle * 2000UL) / 180UL;
+
+    for (int i = 0; i < 60; i++) {
+        GPIOB->ODR |= BIT(SERVO_PIN);
+        delay_us(pulse);
+        GPIOB->ODR &= ~BIT(SERVO_PIN);
+        delay_us(20000 - pulse);
+    }
+}
+
+void door_open(void) {
+    servo_write_angle(SERVO_OPEN_ANGLE);
+}
+
+void door_lock(void) {
+    servo_write_angle(SERVO_LOCK_ANGLE);
+}
+
+/* ---------- Keypad and Password ---------- */
+
+char keypad_get_key(void) {
+    for (int row = 0; row < 4; row++) {
+        GPIOA->ODR |= BIT(0) | BIT(1) | BIT(2) | BIT(3);
+        GPIOA->ODR &= ~BIT(row);
+        delay_us(50);
+
+        for (int col = 0; col < 4; col++) {
+            if ((GPIOA->IDR & BIT(col + 4)) == 0) {
+                delay_ms(20);
+                while ((GPIOA->IDR & BIT(col + 4)) == 0);
+                keypad_idle_mode();
+                return keymap[row][col];
+            }
+        }
+    }
+
+    keypad_idle_mode();
+    return 0;
+}
+
+void reset_password(void) {
+    for (int i = 0; i < 8; i++) entered_password[i] = '\0';
+    password_index = 0;
+}
+
+void show_enter_password_screen(void) {
+    lcd_clear();
+    lcd_set_cursor(0, 0);
+    lcd_print("ENTER PASSWORD");
+    lcd_set_cursor(1, 0);
+}
+
+void check_password(void) {
+    entered_password[password_index] = '\0';
+    lcd_clear();
+
+    if (strcmp(entered_password, PASSWORD) == 0) {
+        lcd_print("CORRECT PASSWORD");
+        lcd_set_cursor(1, 0);
+        lcd_print("DOOR OPENED");
+        buzzer_beep(1);
+        door_open();
+        delay_ms(3000);
+        door_lock();
+    } else {
+        lcd_print("WRONG PASSWORD");
+        lcd_set_cursor(1, 0);
+        lcd_print("TRY AGAIN");
+        buzzer_beep(3);
+        delay_ms(2000);
+    }
+
+    reset_password();
+    show_enter_password_screen();
+}
+
+void process_key(char key) {
+    if (key >= '0' && key <= '9') {
+        entered_password[password_index++] = key;
+        lcd_data('*');
+
+        if (password_index == PASSWORD_LENGTH) check_password();
+    }
+    else if (key == '#') check_password();
+    else if (key == 'C') {
+        reset_password();
+        show_enter_password_screen();
+    }
+    else if (key == 'D') {
+        door_lock();
+        show_enter_password_screen();
+    }
+}
+
+/* ---------- Main Program ---------- */
+
+int main(void) {
+    char key;
+
+    gpio_init();
+    keypad_interrupt_init();
+    lcd_init();
+
+    lcd_print("DOOR LOCK SYSTEM");
+    lcd_set_cursor(1, 0);
+    lcd_print("STARTING...");
+    delay_ms(2000);
+
+    door_lock();
+    reset_password();
+    show_enter_password_screen();
+
+    while (1) {
+        if (keypad_interrupt_flag) {
+            keypad_interrupt_flag = 0;
+            key = keypad_get_key();
+
+            if (key) process_key(key);
+
+            keypad_idle_mode();
+        }
+    }
+}
