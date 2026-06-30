@@ -1,1 +1,2 @@
 # stm_door_lock_system
+This project is using a STM32F401CCU6 microcontroller and writing a code using c programming. The written code is used to control a door lock system. The program is structured using subroutines to handle repeated output operations like controlling the keypad, LCD, servo motor, and buzzer. This improves program organisation, readability and makes it easy for debugging. In addition, an external interrupt is implemented for the keypad input to allow immediate system response.
