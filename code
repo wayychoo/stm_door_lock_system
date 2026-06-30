@@ -197,7 +197,11 @@ void lcd_init(void) {
 }
 
 /* ---------- Buzzer and Servo ---------- */
-
+/* [Yee Xiong Yuan] - Documentation: 
+ * This function handles the buzzer logic. 
+ * It triggers a short beep on success and multiple beeps on failure 
+ * to provide audio feedback to the user.
+ */
 void buzzer_beep(uint8_t times) {
     for (int i = 0; i < times; i++) {
         GPIOB->ODR |= BIT(BUZZER_PIN);
@@ -283,7 +287,11 @@ void check_password(void) {
     reset_password();
     show_enter_password_screen();
 }
-
+/* [Yee Xiong Yuan] - Documentation: 
+ * This function processes inputs from the 4x4 keypad.
+ * It manages password storage, password validation, and system reset 
+ * based on the key pressed (0-9, #, or C).
+ */
 void process_key(char key) {
     if (key >= '0' && key <= '9') {
         entered_password[password_index++] = key;
